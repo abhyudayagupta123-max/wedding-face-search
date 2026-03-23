@@ -1,12 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import csv
-import os
 from collections import defaultdict
-from urllib.parse import unquote
-
 import boto3
-
 
 app = FastAPI()
 
@@ -25,14 +21,57 @@ CSV_FILE = "all_people_matches_master.csv"
 S3_BUCKET = "wedding-pictures-sam-vinay"
 AWS_REGION = "ap-south-1"
 
-# Render will use IAM/env if available.
-# Locally, boto3 will use your configured AWS credentials.
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+# =========================
+# NAME CLEANUP / DISPLAY MAP
+# =========================
+NAME_MAP = {
+    "sam": "Sam",
+    "vinay": "Vinay",
+    "abhy": "Abhy",
+    "mohini": "Mohini",
+    "samsmummy": "Sam's Mom",
+    "samspapa": "Sam's Dad",
+    "vinaysmom": "Vinay's Mom",
+    "vinaysdad": "Vinay's Dad",
+}
+
+# optional aliases from CSV
+ALIASES = {
+    "sam_v2": "sam",
+    "vinay_v2": "vinay",
+    "abhy_v2": "abhy",
+    "mohini_v2": "mohini",
+    "matched_user_id": None,
+    "": None,
+}
 
 
 # =========================
 # HELPERS
 # =========================
+def normalize_person(raw_person: str):
+    raw_person = raw_person.strip().lower()
+
+    if raw_person in ALIASES:
+        return ALIASES[raw_person]
+
+    cleaned = raw_person.replace("_v2", "")
+    cleaned = cleaned.strip()
+
+    if not cleaned or cleaned == "matched_user_id":
+        return None
+
+    return cleaned
+
+
+def display_label(person_id: str):
+    if person_id in NAME_MAP:
+        return NAME_MAP[person_id]
+    return person_id.replace("_", " ").title()
+
+
 def generate_presigned_url(photo_key: str, expires_in: int = 3600) -> str:
     return s3_client.generate_presigned_url(
         "get_object",
@@ -52,38 +91,43 @@ def load_people_from_csv():
 
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
+        next(reader, None)  # skip header
+
         for row in reader:
             if len(row) < 4:
                 continue
 
-            matched_person = row[3].strip().lower()
-            if matched_person:
-                people_set.add(matched_person)
+            person_id = normalize_person(row[3])
+            if person_id:
+                people_set.add(person_id)
 
-    people_list = [{"id": p, "label": p.capitalize()} for p in sorted(people_set)]
+    people_list = [
+        {"id": p, "label": display_label(p)}
+        for p in sorted(people_set, key=lambda x: display_label(x).lower())
+    ]
     return people_list
 
 
 def load_photos_from_csv():
     """
-    Expected CSV row format (based on your file):
+    Expected CSV row format:
     0 = photo_key
     1 = face index
     2 = person label maybe duplicate
     3 = person id / matched person
-    ... rest scores
     """
     grouped = defaultdict(set)
 
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)
+        next(reader, None)  # skip header
+
         for row in reader:
             if len(row) < 4:
                 continue
 
             photo_key = row[0].strip()
-            person_id = row[3].strip().lower()
+            person_id = normalize_person(row[3])
 
             if not photo_key:
                 continue
@@ -91,7 +135,6 @@ def load_photos_from_csv():
             if person_id:
                 grouped[photo_key].add(person_id)
 
-            # If row exists with empty person match, still keep photo
             if photo_key not in grouped:
                 grouped[photo_key] = set()
 
