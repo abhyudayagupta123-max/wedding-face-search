@@ -77,6 +77,7 @@ def load_photos_from_csv():
 
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
+        next(reader, None)
         for row in reader:
             if len(row) < 4:
                 continue
