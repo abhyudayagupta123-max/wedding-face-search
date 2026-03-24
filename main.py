@@ -1,9 +1,12 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from collections import defaultdict
 import csv
 import os
 import boto3
+import zipfile
+import tempfile
 
 
 app = FastAPI()
@@ -21,6 +24,10 @@ S3_BUCKET = "wedding-pictures-sam-vinay"
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+# -----------------------------
+# NAME NORMALIZATION
+# -----------------------------
 
 NAME_MAP = {
     "sam": "Sam",
@@ -54,41 +61,50 @@ ALIASES = {
 def normalize_person(raw_person: str):
     if raw_person is None:
         return None
-
     person = str(raw_person).strip().lower()
     if not person:
         return None
-
-    if person in ALIASES:
-        return ALIASES[person]
-
-    return person
+    return ALIASES.get(person, person)
 
 
 def display_label(person_id: str) -> str:
     if not person_id:
         return ""
-
-    if person_id in NAME_MAP:
-        return NAME_MAP[person_id]
-
-    return person_id.replace("_", " ").title()
+    return NAME_MAP.get(person_id, person_id.replace("_", " ").title())
 
 
 def normalize_people(raw_people: str):
     if not raw_people:
         return []
-
     people = []
     for item in raw_people.split(","):
         normalized = normalize_person(item)
         if normalized and normalized not in people:
             people.append(normalized)
-
     return people
 
 
-def generate_presigned_url(photo_key: str, expires_in: int = 3600) -> str:
+# -----------------------------
+# EVENT DETECTION
+# -----------------------------
+
+def get_event_from_key(key):
+    k = key.lower()
+    if "haldi" in k:
+        return "Haldi"
+    elif "sangeet" in k:
+        return "Sangeet"
+    elif "wedding" in k:
+        return "Wedding"
+    else:
+        return "Other"
+
+
+# -----------------------------
+# S3 URL
+# -----------------------------
+
+def generate_presigned_url(photo_key: str, expires_in: int = 3600):
     try:
         return s3_client.generate_presigned_url(
             "get_object",
@@ -99,96 +115,85 @@ def generate_presigned_url(photo_key: str, expires_in: int = 3600) -> str:
         return ""
 
 
+# -----------------------------
+# LOAD PEOPLE
+# -----------------------------
+
 def load_people_from_csv():
     people_set = set()
 
-    with open(CSV_FILE, "r", encoding="utf-8", newline="") as f:
+    with open(CSV_FILE, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)  # skip header row
+        next(reader, None)
 
         for row in reader:
-            if not row or len(row) <= 3:
+            if len(row) <= 3:
                 continue
-
             person = normalize_person(row[3])
             if person:
                 people_set.add(person)
 
-    # force-add canonical people that must appear cleanly
-    people_set.add("vinay")
-
     ordered_people = [
-        "sam",
-        "vinay",
-        "abhy",
-        "mohini",
-        "samsmummy",
-        "samspapa",
-        "vinaysmummy",
-        "vinayspapa",
+        "sam", "vinay", "abhy", "mohini",
+        "samsmummy", "samspapa",
+        "vinaysmummy", "vinayspapa"
     ]
 
-    final_people = []
-    for person_id in ordered_people:
-        if person_id in people_set:
-            final_people.append(
-                {
-                    "id": person_id,
-                    "label": display_label(person_id),
-                }
-            )
+    final = []
+    for p in ordered_people:
+        if p in people_set:
+            final.append({"id": p, "label": display_label(p)})
 
-    # include any extra normalized people from CSV after known names
     extras = sorted([p for p in people_set if p not in ordered_people])
-    for person_id in extras:
-        final_people.append(
-            {
-                "id": person_id,
-                "label": display_label(person_id),
-            }
-        )
+    for p in extras:
+        final.append({"id": p, "label": display_label(p)})
 
-    return final_people
+    return final
 
+
+# -----------------------------
+# LOAD PHOTOS
+# -----------------------------
 
 def load_photos_from_csv():
     photo_matches = defaultdict(set)
 
-    with open(CSV_FILE, "r", encoding="utf-8", newline="") as f:
+    with open(CSV_FILE, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)  # skip header row
+        next(reader, None)
 
         for row in reader:
-            if not row or len(row) <= 3:
+            if len(row) <= 3:
                 continue
 
-            photo_key = str(row[0]).strip()
+            photo_key = row[0].strip()
             person = normalize_person(row[3])
 
-            if not photo_key:
-                continue
-
-            if person:
-                photo_matches[photo_key].add(person)
-            else:
-                photo_matches[photo_key] = photo_matches[photo_key]
+            if photo_key:
+                if person:
+                    photo_matches[photo_key].add(person)
+                else:
+                    photo_matches[photo_key]
 
     photos = []
+
     for photo_key, matched_people in photo_matches.items():
         image_url = generate_presigned_url(photo_key)
-        thumbnail_url = image_url
 
-        photos.append(
-            {
-                "photo_key": photo_key,
-                "image_url": image_url,
-                "thumbnail_url": thumbnail_url,
-                "matched_people": sorted(list(matched_people)),
-            }
-        )
+        photos.append({
+            "photo_key": photo_key,
+            "image_url": image_url,
+            "thumbnail_url": image_url,
+            "matched_people": sorted(list(matched_people)),
+            "event": get_event_from_key(photo_key),  # ✅ ADDED
+        })
 
     return photos
 
+
+# -----------------------------
+# ROUTES
+# -----------------------------
 
 @app.get("/")
 def root():
@@ -211,21 +216,47 @@ def search_photos(
     if not selected_people:
         return photos
 
-    mode = (mode or "all").strip().lower()
-    if mode not in {"all", "any"}:
-        mode = "all"
-
-    filtered = []
+    mode = mode.lower()
     selected_set = set(selected_people)
 
+    filtered = []
+
     for photo in photos:
-        matched_set = set(photo["matched_people"])
+        matched = set(photo["matched_people"])
 
         if mode == "all":
-            if selected_set.issubset(matched_set):
+            if selected_set.issubset(matched):
                 filtered.append(photo)
-        else:  # mode == "any"
-            if selected_set.intersection(matched_set):
+        else:
+            if selected_set.intersection(matched):
                 filtered.append(photo)
 
     return filtered
+
+
+# -----------------------------
+# DOWNLOAD ZIP API
+# -----------------------------
+
+@app.post("/download-zip")
+async def download_zip(request: Request):
+    data = await request.json()
+    photo_keys = data.get("photo_keys", [])
+
+    if not photo_keys:
+        return {"error": "No photos selected"}
+
+    temp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(temp_dir, "photos.zip")
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for key in photo_keys:
+            local_path = os.path.join(temp_dir, os.path.basename(key))
+
+            try:
+                s3_client.download_file(S3_BUCKET, key, local_path)
+                zipf.write(local_path, os.path.basename(key))
+            except Exception:
+                continue
+
+    return FileResponse(zip_path, filename="photos.zip")
