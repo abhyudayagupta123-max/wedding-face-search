@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import csv
 from collections import defaultdict
+import csv
+import os
 import boto3
+
 
 app = FastAPI()
 
@@ -14,18 +16,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# CONFIG
-# =========================
 CSV_FILE = "all_people_matches_master.csv"
 S3_BUCKET = "wedding-pictures-sam-vinay"
-AWS_REGION = "ap-south-1"
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
 
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 
-# =========================
-# NAME CLEANUP / DISPLAY MAP
-# =========================
 NAME_MAP = {
     "sam": "Sam",
     "vinay": "Vinay",
@@ -33,119 +29,154 @@ NAME_MAP = {
     "mohini": "Mohini",
     "samsmummy": "Sam's Mom",
     "samspapa": "Sam's Dad",
-    "vinaysmom": "Vinay's Mom",
-    "vinaysdad": "Vinay's Dad",
+    "vinaysmummy": "Vinay's Mom",
+    "vinayspapa": "Vinay's Dad",
 }
 
-# optional aliases from CSV
 ALIASES = {
     "sam_v2": "sam",
+    "sam": "sam",
     "vinay_v2": "vinay",
+    "vinay": "vinay",
     "abhy_v2": "abhy",
+    "abhy": "abhy",
     "mohini_v2": "mohini",
+    "mohini": "mohini",
+    "samsmummy": "samsmummy",
+    "samspapa": "samspapa",
+    "vinaysmummy": "vinaysmummy",
+    "vinayspapa": "vinayspapa",
     "matched_user_id": None,
     "": None,
 }
 
 
-# =========================
-# HELPERS
-# =========================
 def normalize_person(raw_person: str):
-    raw_person = raw_person.strip().lower()
-
-    if raw_person in ALIASES:
-        return ALIASES[raw_person]
-
-    cleaned = raw_person.replace("_v2", "")
-    cleaned = cleaned.strip()
-
-    if not cleaned or cleaned == "matched_user_id":
+    if raw_person is None:
         return None
 
-    return cleaned
+    person = str(raw_person).strip().lower()
+    if not person:
+        return None
+
+    if person in ALIASES:
+        return ALIASES[person]
+
+    return person
 
 
-def display_label(person_id: str):
+def display_label(person_id: str) -> str:
+    if not person_id:
+        return ""
+
     if person_id in NAME_MAP:
         return NAME_MAP[person_id]
+
     return person_id.replace("_", " ").title()
-
-
-def generate_presigned_url(photo_key: str, expires_in: int = 3600) -> str:
-    return s3_client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": photo_key},
-        ExpiresIn=expires_in,
-    )
 
 
 def normalize_people(raw_people: str):
     if not raw_people:
         return []
-    return [p.strip().lower() for p in raw_people.split(",") if p.strip()]
+
+    people = []
+    for item in raw_people.split(","):
+        normalized = normalize_person(item)
+        if normalized and normalized not in people:
+            people.append(normalized)
+
+    return people
+
+
+def generate_presigned_url(photo_key: str, expires_in: int = 3600) -> str:
+    try:
+        return s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": photo_key},
+            ExpiresIn=expires_in,
+        )
+    except Exception:
+        return ""
 
 
 def load_people_from_csv():
     people_set = set()
 
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
+    with open(CSV_FILE, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
-        next(reader, None)  # skip header
+        next(reader, None)  # skip header row
 
         for row in reader:
-            if len(row) < 4:
+            if not row or len(row) <= 3:
                 continue
 
-            person_id = normalize_person(row[3])
-            if person_id:
-                people_set.add(person_id)
+            person = normalize_person(row[3])
+            if person:
+                people_set.add(person)
 
-    people_list = [
-        {"id": p, "label": display_label(p)}
-        for p in sorted(people_set, key=lambda x: display_label(x).lower())
+    # force-add canonical people that must appear cleanly
+    people_set.add("vinay")
+
+    ordered_people = [
+        "sam",
+        "vinay",
+        "abhy",
+        "mohini",
+        "samsmummy",
+        "samspapa",
+        "vinaysmummy",
+        "vinayspapa",
     ]
-    return people_list
+
+    final_people = []
+    for person_id in ordered_people:
+        if person_id in people_set:
+            final_people.append(
+                {
+                    "id": person_id,
+                    "label": display_label(person_id),
+                }
+            )
+
+    # include any extra normalized people from CSV after known names
+    extras = sorted([p for p in people_set if p not in ordered_people])
+    for person_id in extras:
+        final_people.append(
+            {
+                "id": person_id,
+                "label": display_label(person_id),
+            }
+        )
+
+    return final_people
 
 
 def load_photos_from_csv():
-    """
-    Expected CSV row format:
-    0 = photo_key
-    1 = face index
-    2 = person label maybe duplicate
-    3 = person id / matched person
-    """
-    grouped = defaultdict(set)
+    photo_matches = defaultdict(set)
 
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
+    with open(CSV_FILE, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
-        next(reader, None)  # skip header
+        next(reader, None)  # skip header row
 
         for row in reader:
-            if len(row) < 4:
+            if not row or len(row) <= 3:
                 continue
 
-            photo_key = row[0].strip()
-            person_id = normalize_person(row[3])
+            photo_key = str(row[0]).strip()
+            person = normalize_person(row[3])
 
             if not photo_key:
                 continue
 
-            if person_id:
-                grouped[photo_key].add(person_id)
-
-            if photo_key not in grouped:
-                grouped[photo_key] = set()
+            if person:
+                photo_matches[photo_key].add(person)
+            else:
+                photo_matches[photo_key] = photo_matches[photo_key]
 
     photos = []
-    for photo_key, matched_people in grouped.items():
-        try:
-            image_url = generate_presigned_url(photo_key)
-            thumbnail_url = image_url
-        except Exception:
-            image_url = ""
-            thumbnail_url = ""
+    for photo_key, matched_people in photo_matches.items():
+        image_url = generate_presigned_url(photo_key)
+        thumbnail_url = image_url
 
         photos.append(
             {
@@ -159,11 +190,8 @@ def load_photos_from_csv():
     return photos
 
 
-# =========================
-# ROUTES
-# =========================
 @app.get("/")
-def home():
+def root():
     return {"message": "API is running 🚀"}
 
 
@@ -173,30 +201,31 @@ def get_people():
 
 
 @app.get("/api/search")
-def search_photos(people: str = "", mode: str = "all"):
+def search_photos(
+    people: str = Query(default=""),
+    mode: str = Query(default="all"),
+):
     selected_people = normalize_people(people)
-    all_photos = load_photos_from_csv()
+    photos = load_photos_from_csv()
 
     if not selected_people:
-        return {
-            "count": len(all_photos),
-            "results": all_photos,
-        }
+        return photos
 
-    results = []
+    mode = (mode or "all").strip().lower()
+    if mode not in {"all", "any"}:
+        mode = "all"
+
+    filtered = []
     selected_set = set(selected_people)
 
-    for photo in all_photos:
+    for photo in photos:
         matched_set = set(photo["matched_people"])
 
-        if mode == "any":
-            if matched_set.intersection(selected_set):
-                results.append(photo)
-        else:
+        if mode == "all":
             if selected_set.issubset(matched_set):
-                results.append(photo)
+                filtered.append(photo)
+        else:  # mode == "any"
+            if selected_set.intersection(matched_set):
+                filtered.append(photo)
 
-    return {
-        "count": len(results),
-        "results": results,
-    }
+    return filtered
